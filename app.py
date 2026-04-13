@@ -26,6 +26,38 @@ def clean_tickers(user_input: str) -> List[str]:
     return list(dict.fromkeys(tickers))
 
 
+def safe_float(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def get_first_valid_value(df: pd.DataFrame, candidates: List[str]) -> Optional[float]:
+    try:
+        if df is None or df.empty:
+            return None
+        for candidate in candidates:
+            if candidate in df.index:
+                row = df.loc[candidate]
+                if isinstance(row, pd.Series):
+                    for value in row:
+                        val = safe_float(value)
+                        if val is not None:
+                            return val
+                else:
+                    val = safe_float(row)
+                    if val is not None:
+                        return val
+    except Exception:
+        return None
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner="Fetching stock data...")
 def load_price_data(tickers: List[str]) -> pd.DataFrame:
     if not tickers:
@@ -43,14 +75,46 @@ def load_price_data(tickers: List[str]) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Fetching valuation data...")
-def load_stock_info(ticker: str) -> dict:
+@st.cache_data(ttl=3600, show_spinner="Fetching company data...")
+def load_stock_package(ticker: str) -> dict:
+    stock = yf.Ticker(ticker)
+
+    package = {
+        "info": {},
+        "income_stmt": pd.DataFrame(),
+        "balance_sheet": pd.DataFrame(),
+        "cashflow": pd.DataFrame(),
+        "dividends": pd.Series(dtype=float),
+    }
+
     try:
-        stock = yf.Ticker(ticker)
         info = stock.info
-        return info if isinstance(info, dict) else {}
+        if isinstance(info, dict):
+            package["info"] = info
     except Exception:
-        return {}
+        pass
+
+    try:
+        package["income_stmt"] = stock.income_stmt
+    except Exception:
+        pass
+
+    try:
+        package["balance_sheet"] = stock.balance_sheet
+    except Exception:
+        pass
+
+    try:
+        package["cashflow"] = stock.cashflow
+    except Exception:
+        pass
+
+    try:
+        package["dividends"] = stock.dividends
+    except Exception:
+        pass
+
+    return package
 
 
 def extract_close_series(price_data: pd.DataFrame, ticker: str) -> pd.Series:
@@ -82,7 +146,7 @@ def compute_stock_metrics(close: pd.Series) -> dict:
     max_drawdown = drawdown.min()
 
     sharpe = None
-    if daily_returns.std() and daily_returns.std() != 0:
+    if len(daily_returns) > 1 and daily_returns.std() != 0:
         sharpe = (daily_returns.mean() / daily_returns.std()) * math.sqrt(252)
 
     return {
@@ -96,33 +160,134 @@ def compute_stock_metrics(close: pd.Series) -> dict:
     }
 
 
-def safe_float(value) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
+def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dict:
+    package = load_stock_package(ticker)
+    info = package["info"]
+    income_stmt = package["income_stmt"]
+    balance_sheet = package["balance_sheet"]
+    cashflow = package["cashflow"]
+    dividends = package["dividends"]
 
-
-def run_value_estimate(ticker: str, close: pd.Series) -> dict:
-    info = load_stock_info(ticker)
-
-    current_price = float(close.iloc[-1])
-    score = 0
-    reasons = []
+    market_cap = safe_float(info.get("marketCap"))
+    shares_outstanding = safe_float(info.get("sharesOutstanding"))
+    enterprise_value = safe_float(info.get("enterpriseValue"))
+    target_price = safe_float(info.get("targetMeanPrice"))
 
     pe = safe_float(info.get("trailingPE"))
     pb = safe_float(info.get("priceToBook"))
     peg = safe_float(info.get("pegRatio"))
     ev_to_ebitda = safe_float(info.get("enterpriseToEbitda"))
     dividend_yield = safe_float(info.get("dividendYield"))
-    target_price = safe_float(info.get("targetMeanPrice"))
+
+    net_income = get_first_valid_value(
+        income_stmt,
+        [
+            "Net Income",
+            "Net Income Common Stockholders",
+            "Net Income Including Noncontrolling Interests",
+        ],
+    )
+
+    ebitda = get_first_valid_value(
+        income_stmt,
+        [
+            "EBITDA",
+            "Normalized EBITDA",
+        ],
+    )
+
+    total_equity = get_first_valid_value(
+        balance_sheet,
+        [
+            "Stockholders Equity",
+            "Total Equity Gross Minority Interest",
+            "Common Stock Equity",
+            "Total Stockholder Equity",
+        ],
+    )
+
+    if market_cap is None and shares_outstanding is not None:
+        market_cap = current_price * shares_outstanding
+
+    if pe is None and market_cap is not None and net_income not in [None, 0]:
+        pe = market_cap / net_income if net_income > 0 else None
+
+    if pb is None and market_cap is not None and total_equity not in [None, 0]:
+        pb = market_cap / total_equity if total_equity > 0 else None
+
+    if ev_to_ebitda is None and enterprise_value is not None and ebitda not in [None, 0]:
+        ev_to_ebitda = enterprise_value / ebitda if ebitda > 0 else None
+
+    if dividend_yield is None:
+        try:
+            if dividends is not None and not dividends.empty:
+                recent_dividends = dividends[dividends.index >= (pd.Timestamp.today() - pd.Timedelta(days=365))]
+                annual_dividends = safe_float(recent_dividends.sum())
+                if annual_dividends is not None and current_price > 0:
+                    dividend_yield = annual_dividends / current_price
+        except Exception:
+            pass
+
+    book_value_per_share = None
+    eps = None
+    implied_fair_value = None
+
+    if shares_outstanding not in [None, 0]:
+        if total_equity is not None and shares_outstanding > 0:
+            book_value_per_share = total_equity / shares_outstanding
+        if net_income is not None and shares_outstanding > 0:
+            eps = net_income / shares_outstanding
+
+    fair_value_components = []
+
+    if eps is not None and eps > 0:
+        fair_value_components.append(eps * 18)
+
+    if book_value_per_share is not None and book_value_per_share > 0:
+        fair_value_components.append(book_value_per_share * 3)
+
+    if target_price is not None and target_price > 0:
+        fair_value_components.append(target_price)
+
+    if fair_value_components:
+        implied_fair_value = sum(fair_value_components) / len(fair_value_components)
+
+    return {
+        "market_cap": market_cap,
+        "shares_outstanding": shares_outstanding,
+        "net_income": net_income,
+        "ebitda": ebitda,
+        "total_equity": total_equity,
+        "pe": pe,
+        "pb": pb,
+        "peg": peg,
+        "ev_to_ebitda": ev_to_ebitda,
+        "dividend_yield": dividend_yield,
+        "target_price": target_price,
+        "eps": eps,
+        "book_value_per_share": book_value_per_share,
+        "implied_fair_value": implied_fair_value,
+    }
+
+
+def run_value_estimate(ticker: str, close: pd.Series) -> dict:
+    current_price = float(close.iloc[-1])
+    metrics = compute_fallback_valuation_metrics(ticker, current_price)
+
+    pe = metrics["pe"]
+    pb = metrics["pb"]
+    peg = metrics["peg"]
+    ev_to_ebitda = metrics["ev_to_ebitda"]
+    dividend_yield = metrics["dividend_yield"]
+    target_price = metrics["target_price"]
+    implied_fair_value = metrics["implied_fair_value"]
+
+    score = 0
+    reasons = []
 
     ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
     ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
 
-    # --- Valuation rules ---
     if pe is not None:
         if pe < 18:
             score += 2
@@ -134,7 +299,7 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 2
             reasons.append(f"P/E looks expensive at {pe:.2f}")
         else:
-            reasons.append(f"P/E is elevated but not extreme at {pe:.2f}")
+            reasons.append(f"P/E is somewhat elevated at {pe:.2f}")
 
     if pb is not None:
         if pb < 3:
@@ -147,10 +312,10 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
     if peg is not None:
         if peg < 1:
             score += 2
-            reasons.append(f"PEG suggests attractive growth-adjusted valuation at {peg:.2f}")
+            reasons.append(f"PEG looks attractive at {peg:.2f}")
         elif peg > 2:
             score -= 2
-            reasons.append(f"PEG suggests expensive growth-adjusted valuation at {peg:.2f}")
+            reasons.append(f"PEG looks expensive at {peg:.2f}")
 
     if ev_to_ebitda is not None:
         if ev_to_ebitda < 10:
@@ -166,20 +331,29 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             reasons.append(f"Dividend yield is supportive at {dividend_yield:.2%}")
 
     if target_price is not None:
-        implied_upside = (target_price / current_price) - 1
-        if implied_upside > 0.15:
+        target_upside = (target_price / current_price) - 1
+        if target_upside > 0.15:
             score += 2
-            reasons.append(f"Analyst target implies upside of {implied_upside:.2%}")
-        elif implied_upside > 0.05:
+            reasons.append(f"Analyst target implies upside of {target_upside:.2%}")
+        elif target_upside > 0.05:
             score += 1
-            reasons.append(f"Analyst target implies some upside of {implied_upside:.2%}")
-        elif implied_upside < -0.10:
+            reasons.append(f"Analyst target implies moderate upside of {target_upside:.2%}")
+        elif target_upside < -0.10:
             score -= 2
-            reasons.append(f"Analyst target implies downside of {implied_upside:.2%}")
-        else:
-            reasons.append(f"Analyst target is close to current price at {implied_upside:.2%}")
+            reasons.append(f"Analyst target implies downside of {target_upside:.2%}")
 
-    # --- Trend rules ---
+    if implied_fair_value is not None:
+        fair_value_gap = (implied_fair_value / current_price) - 1
+        if fair_value_gap > 0.15:
+            score += 2
+            reasons.append(f"Estimated fair value implies upside of {fair_value_gap:.2%}")
+        elif fair_value_gap > 0.05:
+            score += 1
+            reasons.append(f"Estimated fair value implies modest upside of {fair_value_gap:.2%}")
+        elif fair_value_gap < -0.10:
+            score -= 2
+            reasons.append(f"Estimated fair value implies downside of {fair_value_gap:.2%}")
+
     if ma50 is not None:
         if current_price > ma50:
             score += 1
@@ -196,7 +370,6 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 2
             reasons.append("Price is below the 200 day moving average")
 
-    # --- Momentum rules ---
     if len(close) >= 126:
         six_month_return = (close.iloc[-1] / close.iloc[-126]) - 1
         if six_month_return > 0.15:
@@ -206,7 +379,6 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 1
             reasons.append(f"Weak 6 month momentum at {six_month_return:.2%}")
 
-    # --- Risk penalty ---
     daily_returns = close.pct_change().dropna()
     if not daily_returns.empty:
         annual_volatility = daily_returns.std() * math.sqrt(252)
@@ -221,7 +393,6 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 1
             reasons.append(f"Large max drawdown at {max_drawdown:.2%}")
 
-    # --- Final labels ---
     if score >= 5:
         value_label = "Undervalued"
         action_label = "BUY"
@@ -249,6 +420,9 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
         "ev_to_ebitda": ev_to_ebitda,
         "dividend_yield": dividend_yield,
         "target_price": target_price,
+        "eps": metrics["eps"],
+        "book_value_per_share": metrics["book_value_per_share"],
+        "implied_fair_value": implied_fair_value,
         "reasons": reasons,
     }
 
@@ -279,7 +453,6 @@ if close_table.empty:
 
 valid_tickers = close_table.columns.tolist()
 
-# ---------- Section 1 ----------
 st.header("1. Stock Signal")
 
 selected_ticker = st.selectbox("Choose a stock for deeper analysis", valid_tickers, index=0)
@@ -321,6 +494,18 @@ if show_value_estimate:
         st.write(
             f"Analyst Mean Target: ${valuation['target_price']:,.2f}"
             if valuation["target_price"] is not None else "Analyst Mean Target: N/A"
+        )
+        st.write(
+            f"EPS Estimate: ${valuation['eps']:,.2f}"
+            if valuation["eps"] is not None else "EPS Estimate: N/A"
+        )
+        st.write(
+            f"Book Value Per Share: ${valuation['book_value_per_share']:,.2f}"
+            if valuation["book_value_per_share"] is not None else "Book Value Per Share: N/A"
+        )
+        st.write(
+            f"Implied Fair Value: ${valuation['implied_fair_value']:,.2f}"
+            if valuation["implied_fair_value"] is not None else "Implied Fair Value: N/A"
         )
 
         st.write("Reasons:")
@@ -373,7 +558,6 @@ st.plotly_chart(fig_single, use_container_width=True)
 
 st.divider()
 
-# ---------- Section 2 ----------
 st.header("2. Compare Stocks")
 
 comparison_rows = []
@@ -416,9 +600,7 @@ st.plotly_chart(fig_compare, use_container_width=True)
 
 st.divider()
 
-# ---------- Section 3 ----------
 st.header("3. Portfolio Builder")
-
 st.write("Assign a weight to each stock. The weights should add up to 100%.")
 
 weights = {}
@@ -455,7 +637,7 @@ else:
     portfolio_max_drawdown = portfolio_drawdown.min()
 
     portfolio_sharpe = None
-    if portfolio_daily_returns.std() and portfolio_daily_returns.std() != 0:
+    if len(portfolio_daily_returns) > 1 and portfolio_daily_returns.std() != 0:
         portfolio_sharpe = (
             portfolio_daily_returns.mean() / portfolio_daily_returns.std()
         ) * math.sqrt(252)
