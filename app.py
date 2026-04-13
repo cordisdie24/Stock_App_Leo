@@ -18,6 +18,7 @@ tickers_input = st.sidebar.text_input(
 
 show_value_estimate = st.sidebar.checkbox("Value Estimate", value=True)
 show_raw_data = st.sidebar.checkbox("Show raw data", value=False)
+debug_fundamentals = st.sidebar.checkbox("Debug fundamentals", value=False)
 
 
 def clean_tickers(user_input: str) -> List[str]:
@@ -160,8 +161,10 @@ def compute_stock_metrics(close: pd.Series) -> dict:
     }
 
 
-def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dict:
+def compute_fallback_valuation_metrics(ticker: str, close: pd.Series) -> dict:
+    current_price = float(close.iloc[-1])
     package = load_stock_package(ticker)
+
     info = package["info"]
     income_stmt = package["income_stmt"]
     balance_sheet = package["balance_sheet"]
@@ -230,7 +233,6 @@ def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dic
 
     book_value_per_share = None
     eps = None
-    implied_fair_value = None
 
     if shares_outstanding not in [None, 0]:
         if total_equity is not None and shares_outstanding > 0:
@@ -238,6 +240,7 @@ def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dic
         if net_income is not None and shares_outstanding > 0:
             eps = net_income / shares_outstanding
 
+    implied_fair_value = None
     fair_value_components = []
 
     if eps is not None and eps > 0:
@@ -249,10 +252,29 @@ def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dic
     if target_price is not None and target_price > 0:
         fair_value_components.append(target_price)
 
+    # Backup estimate from price behavior if fundamentals are unavailable
+    ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+    one_year_return = (close.iloc[-1] / close.iloc[0]) - 1 if len(close) > 1 else None
+
+    if ma200 is not None:
+        fair_value_components.append(ma200)
+
+    if one_year_return is not None:
+        if one_year_return > 0.20:
+            fair_value_components.append(current_price * 1.05)
+        elif one_year_return < -0.20:
+            fair_value_components.append(current_price * 0.95)
+        else:
+            fair_value_components.append(current_price)
+
     if fair_value_components:
         implied_fair_value = sum(fair_value_components) / len(fair_value_components)
 
     return {
+        "info": info,
+        "income_stmt": income_stmt,
+        "balance_sheet": balance_sheet,
+        "cashflow": cashflow,
         "market_cap": market_cap,
         "shares_outstanding": shares_outstanding,
         "net_income": net_income,
@@ -272,15 +294,15 @@ def compute_fallback_valuation_metrics(ticker: str, current_price: float) -> dic
 
 def run_value_estimate(ticker: str, close: pd.Series) -> dict:
     current_price = float(close.iloc[-1])
-    metrics = compute_fallback_valuation_metrics(ticker, current_price)
+    data = compute_fallback_valuation_metrics(ticker, close)
 
-    pe = metrics["pe"]
-    pb = metrics["pb"]
-    peg = metrics["peg"]
-    ev_to_ebitda = metrics["ev_to_ebitda"]
-    dividend_yield = metrics["dividend_yield"]
-    target_price = metrics["target_price"]
-    implied_fair_value = metrics["implied_fair_value"]
+    pe = data["pe"]
+    pb = data["pb"]
+    peg = data["peg"]
+    ev_to_ebitda = data["ev_to_ebitda"]
+    dividend_yield = data["dividend_yield"]
+    target_price = data["target_price"]
+    implied_fair_value = data["implied_fair_value"]
 
     score = 0
     reasons = []
@@ -298,8 +320,6 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
         elif pe > 35:
             score -= 2
             reasons.append(f"P/E looks expensive at {pe:.2f}")
-        else:
-            reasons.append(f"P/E is somewhat elevated at {pe:.2f}")
 
     if pb is not None:
         if pb < 3:
@@ -325,10 +345,9 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 1
             reasons.append(f"EV/EBITDA looks expensive at {ev_to_ebitda:.2f}")
 
-    if dividend_yield is not None:
-        if dividend_yield > 0.03:
-            score += 1
-            reasons.append(f"Dividend yield is supportive at {dividend_yield:.2%}")
+    if dividend_yield is not None and dividend_yield > 0.03:
+        score += 1
+        reasons.append(f"Dividend yield is supportive at {dividend_yield:.2%}")
 
     if target_price is not None:
         target_upside = (target_price / current_price) - 1
@@ -386,13 +405,6 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
             score -= 1
             reasons.append(f"High annualized volatility at {annual_volatility:.2%}")
 
-        running_max = close.cummax()
-        drawdown = (close / running_max) - 1
-        max_drawdown = drawdown.min()
-        if max_drawdown < -0.35:
-            score -= 1
-            reasons.append(f"Large max drawdown at {max_drawdown:.2%}")
-
     if score >= 5:
         value_label = "Undervalued"
         action_label = "BUY"
@@ -420,10 +432,11 @@ def run_value_estimate(ticker: str, close: pd.Series) -> dict:
         "ev_to_ebitda": ev_to_ebitda,
         "dividend_yield": dividend_yield,
         "target_price": target_price,
-        "eps": metrics["eps"],
-        "book_value_per_share": metrics["book_value_per_share"],
+        "eps": data["eps"],
+        "book_value_per_share": data["book_value_per_share"],
         "implied_fair_value": implied_fair_value,
         "reasons": reasons,
+        "debug_data": data,
     }
 
 
@@ -511,6 +524,31 @@ if show_value_estimate:
         st.write("Reasons:")
         for reason in valuation["reasons"]:
             st.write(f"• {reason}")
+
+    if debug_fundamentals:
+        debug = valuation["debug_data"]
+        st.divider()
+        st.subheader("Fundamentals Debug")
+
+        d1, d2, d3 = st.columns(3)
+        d1.write(f"Info keys: {len(debug['info'])}")
+        d2.write(f"Income statement empty: {debug['income_stmt'].empty}")
+        d3.write(f"Balance sheet empty: {debug['balance_sheet'].empty}")
+
+        st.write(f"Cash flow empty: {debug['cashflow'].empty}")
+        st.write(f"Net income extracted: {debug['net_income']}")
+        st.write(f"EBITDA extracted: {debug['ebitda']}")
+        st.write(f"Total equity extracted: {debug['total_equity']}")
+        st.write(f"Shares outstanding: {debug['shares_outstanding']}")
+        st.write(f"Market cap: {debug['market_cap']}")
+
+        if not debug["income_stmt"].empty:
+            st.write("Income statement preview")
+            st.dataframe(debug["income_stmt"].head(15), use_container_width=True)
+
+        if not debug["balance_sheet"].empty:
+            st.write("Balance sheet preview")
+            st.dataframe(debug["balance_sheet"].head(15), use_container_width=True)
 
 fig_single = go.Figure()
 fig_single.add_trace(
