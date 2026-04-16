@@ -1,17 +1,138 @@
 import math
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
+from scipy import stats
 
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
+
+TRADING_DAYS = 252
+BENCHMARK_TICKER = "^GSPC"
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA"]
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching stock data...")
+def load_data(symbols: tuple[str, ...], start: date, end: date) -> dict[str, pd.DataFrame]:
+    """Download daily stock data from Yahoo Finance for one or more symbols."""
+    data_map: dict[str, pd.DataFrame] = {}
+
+    for symbol in symbols:
+        if not symbol:
+            continue
+
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end + timedelta(days=1),
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        if not df.empty:
+            df = df.sort_index()
+
+        data_map[symbol] = df
+
+    return data_map
+
+
+def validate_data(df: pd.DataFrame) -> bool:
+    required_cols = {"Close", "Volume"}
+    return not df.empty and required_cols.issubset(df.columns)
+
+
+def enrich_single_asset(df: pd.DataFrame, ma_window: int, vol_window: int) -> pd.DataFrame:
+    out = df.copy().dropna(subset=["Close"])
+    out["Daily Return"] = out["Close"].pct_change()
+    out["Cumulative Return"] = (1 + out["Daily Return"].fillna(0)).cumprod() - 1
+    out[f"{ma_window}-Day MA"] = out["Close"].rolling(window=ma_window).mean()
+    out["Rolling Volatility"] = out["Daily Return"].rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
+    out["Rolling Mean Return"] = out["Daily Return"].rolling(vol_window).mean()
+    return out
+
+
+def compute_summary_stats(returns: pd.Series, risk_free_rate: float) -> dict[str, float]:
+    returns = returns.dropna()
+    if returns.empty:
+        return {
+            "Total Return": float("nan"),
+            "Avg Daily Return": float("nan"),
+            "Annualized Return": float("nan"),
+            "Annualized Volatility": float("nan"),
+            "Sharpe Ratio": float("nan"),
+            "Skewness": float("nan"),
+            "Excess Kurtosis": float("nan"),
+            "Jarque-Bera Stat": float("nan"),
+            "Jarque-Bera p-value": float("nan"),
+            "Observations": 0,
+        }
+
+    cumulative = (1 + returns).cumprod() - 1
+    avg_daily_ret = float(returns.mean())
+    volatility = float(returns.std())
+    ann_volatility = volatility * math.sqrt(TRADING_DAYS) if not math.isnan(volatility) else float("nan")
+    ann_return = avg_daily_ret * TRADING_DAYS if not math.isnan(avg_daily_ret) else float("nan")
+    sharpe = (
+        (ann_return - risk_free_rate) / ann_volatility
+        if ann_volatility and not math.isnan(ann_volatility)
+        else float("nan")
+    )
+
+    jb_stat, jb_pvalue = stats.jarque_bera(returns)
+
+    return {
+        "Total Return": float(cumulative.iloc[-1]),
+        "Avg Daily Return": avg_daily_ret,
+        "Annualized Return": ann_return,
+        "Annualized Volatility": ann_volatility,
+        "Sharpe Ratio": sharpe,
+        "Skewness": float(returns.skew()),
+        "Excess Kurtosis": float(returns.kurtosis()),
+        "Jarque-Bera Stat": float(jb_stat),
+        "Jarque-Bera p-value": float(jb_pvalue),
+        "Observations": int(returns.shape[0]),
+    }
+
+
+def format_metric(value: float, kind: str = "number") -> str:
+    if pd.isna(value):
+        return "N/A"
+    if kind == "currency":
+        return f"${value:,.2f}"
+    if kind == "percent":
+        return f"{value:.2%}"
+    if kind == "small_percent":
+        return f"{value:.4%}"
+    if kind == "integer":
+        return f"{int(value):,}"
+    return f"{value:.2f}"
+
 
 st.title("Stock Analysis Dashboard")
 st.sidebar.header("Settings")
 
-ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").strip().upper()
+raw_tickers = st.sidebar.text_input(
+    "Tickers (comma-separated)", value=", ".join(DEFAULT_TICKERS)
+)
+user_tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
+user_tickers = list(dict.fromkeys(user_tickers))
+
+include_benchmark = st.sidebar.checkbox("Include S&P 500 Benchmark (^GSPC)", value=True)
+
+portfolio_tickers = list(user_tickers)
+fetch_tickers = list(user_tickers)
+if include_benchmark and BENCHMARK_TICKER not in fetch_tickers:
+    fetch_tickers.append(BENCHMARK_TICKER)
 
 default_start = date.today() - timedelta(days=365)
 start_date = st.sidebar.date_input("Start Date", value=default_start)
@@ -48,105 +169,149 @@ vol_window = st.sidebar.slider(
     step=5,
 )
 
+corr_window = st.sidebar.slider(
+    "Rolling Correlation Window (days)",
+    min_value=10,
+    max_value=120,
+    value=30,
+    step=5,
+)
 
-@st.cache_data(ttl=3600, show_spinner="Fetching stock data...")
-def load_data(symbol: str, start: date, end: date) -> pd.DataFrame:
-    """
-    Download daily stock data from Yahoo Finance for a given date range.
-    """
-    if not symbol:
-        return pd.DataFrame()
+qq_sample_size = st.sidebar.slider(
+    "Q-Q Plot Sample Size", min_value=50, max_value=500, value=250, step=25
+)
 
-    df = yf.download(
-        symbol,
-        start=start,
-        end=end + timedelta(days=1),
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    return df
-
-
-def validate_data(df: pd.DataFrame) -> bool:
-    required_cols = {"Close", "Volume"}
-    return not df.empty and required_cols.issubset(df.columns)
-
-
-if not ticker:
-    st.info("Enter a stock ticker in the sidebar to get started.")
+if not portfolio_tickers:
+    st.info("Enter at least one stock ticker in the sidebar to get started.")
     st.stop()
 
 try:
-    df = load_data(ticker, start_date, end_date)
+    raw_data = load_data(tuple(fetch_tickers), start_date, end_date)
 except Exception as e:
     st.error("Failed to download stock data.")
     st.exception(e)
     st.stop()
 
-if not validate_data(df):
-    st.error(f"No data found for {ticker}. Try another ticker symbol or date range.")
+asset_data: dict[str, pd.DataFrame] = {}
+invalid_tickers: list[str] = []
+
+for ticker in portfolio_tickers:
+    df = raw_data.get(ticker, pd.DataFrame())
+    if validate_data(df):
+        asset_data[ticker] = enrich_single_asset(df, ma_window, vol_window)
+    else:
+        invalid_tickers.append(ticker)
+
+if invalid_tickers:
+    st.warning(f"No data found for: {', '.join(invalid_tickers)}")
+
+if not asset_data:
+    st.error("No valid stock data was returned. Try different tickers or a wider date range.")
     st.stop()
 
-df = df.copy().dropna(subset=["Close"])
-df["Daily Return"] = df["Close"].pct_change()
-df["Cumulative Return"] = (1 + df["Daily Return"].fillna(0)).cumprod() - 1
-df[f"{ma_window}-Day MA"] = df["Close"].rolling(window=ma_window).mean()
-df["Rolling Volatility"] = df["Daily Return"].rolling(vol_window).std() * math.sqrt(252)
+benchmark_df = pd.DataFrame()
+if include_benchmark:
+    benchmark_raw = raw_data.get(BENCHMARK_TICKER, pd.DataFrame())
+    if validate_data(benchmark_raw):
+        benchmark_df = enrich_single_asset(benchmark_raw, ma_window, vol_window)
+    else:
+        st.warning("S&P 500 benchmark data could not be loaded for this period.")
 
-latest_close = float(df["Close"].iloc[-1])
-total_return = float(df["Cumulative Return"].iloc[-1])
-avg_daily_ret = float(df["Daily Return"].mean())
-volatility = float(df["Daily Return"].std())
-ann_volatility = volatility * math.sqrt(252)
-ann_return = avg_daily_ret * 252
-sharpe = (ann_return - risk_free_rate) / ann_volatility if ann_volatility and not math.isnan(ann_volatility) else float("nan")
-skewness = float(df["Daily Return"].skew())
-kurtosis = float(df["Daily Return"].kurtosis())
-max_close = float(df["Close"].max())
-min_close = float(df["Close"].min())
+primary_ticker = next(iter(asset_data.keys()))
+primary_df = asset_data[primary_ticker]
 
-st.subheader(f"{ticker} Key Metrics")
+price_df = pd.concat(
+    [df["Close"].rename(ticker) for ticker, df in asset_data.items()], axis=1
+).dropna(how="all")
+return_df = pd.concat(
+    [df["Daily Return"].rename(ticker) for ticker, df in asset_data.items()], axis=1
+).dropna(how="all")
+cumulative_df = (1 + return_df.fillna(0)).cumprod() - 1
 
+portfolio_returns = return_df.copy().dropna(how="all")
+portfolio_returns["Equal Weight Portfolio"] = portfolio_returns.mean(axis=1, skipna=True)
+portfolio_cumulative = (1 + portfolio_returns["Equal Weight Portfolio"].fillna(0)).cumprod() - 1
+portfolio_vol = portfolio_returns["Equal Weight Portfolio"].rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
+
+summary_rows = []
+for ticker, df in asset_data.items():
+    stats_map = compute_summary_stats(df["Daily Return"], risk_free_rate)
+    stats_map.update(
+        {
+            "Ticker": ticker,
+            "Latest Close": float(df["Close"].iloc[-1]),
+            "Period High": float(df["Close"].max()),
+            "Period Low": float(df["Close"].min()),
+        }
+    )
+    summary_rows.append(stats_map)
+
+portfolio_stats = compute_summary_stats(portfolio_returns["Equal Weight Portfolio"], risk_free_rate)
+portfolio_stats.update(
+    {
+        "Ticker": "Equal Weight Portfolio",
+        "Latest Close": float("nan"),
+        "Period High": float("nan"),
+        "Period Low": float("nan"),
+    }
+)
+summary_rows.append(portfolio_stats)
+
+if not benchmark_df.empty:
+    benchmark_stats = compute_summary_stats(benchmark_df["Daily Return"], risk_free_rate)
+    benchmark_stats.update(
+        {
+            "Ticker": "^GSPC",
+            "Latest Close": float(benchmark_df["Close"].iloc[-1]),
+            "Period High": float(benchmark_df["Close"].max()),
+            "Period Low": float(benchmark_df["Close"].min()),
+        }
+    )
+    summary_rows.append(benchmark_stats)
+
+summary_df = pd.DataFrame(summary_rows).set_index("Ticker")
+
+latest_close = float(primary_df["Close"].iloc[-1])
+primary_stats = compute_summary_stats(primary_df["Daily Return"], risk_free_rate)
+max_close = float(primary_df["Close"].max())
+min_close = float(primary_df["Close"].min())
+
+st.subheader(f"{primary_ticker} Key Metrics")
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Latest Close", f"${latest_close:,.2f}")
-col2.metric("Total Return", f"{total_return:.2%}")
-col3.metric("Annualized Return", f"{ann_return:.2%}")
-col4.metric("Sharpe Ratio", "N/A" if math.isnan(sharpe) else f"{sharpe:.2f}")
+col1.metric("Latest Close", format_metric(latest_close, "currency"))
+col2.metric("Total Return", format_metric(primary_stats["Total Return"], "percent"))
+col3.metric("Annualized Return", format_metric(primary_stats["Annualized Return"], "percent"))
+col4.metric("Sharpe Ratio", format_metric(primary_stats["Sharpe Ratio"]))
 
 col5, col6, col7, col8 = st.columns(4)
-col5.metric("Annualized Volatility", f"{ann_volatility:.2%}")
-col6.metric("Skewness", f"{skewness:.2f}")
-col7.metric("Excess Kurtosis", f"{kurtosis:.2f}")
-col8.metric("Avg Daily Return", f"{avg_daily_ret:.4%}")
+col5.metric("Annualized Volatility", format_metric(primary_stats["Annualized Volatility"], "percent"))
+col6.metric("Skewness", format_metric(primary_stats["Skewness"]))
+col7.metric("Excess Kurtosis", format_metric(primary_stats["Excess Kurtosis"]))
+col8.metric("Avg Daily Return", format_metric(primary_stats["Avg Daily Return"], "small_percent"))
 
-col9, col10, _, _ = st.columns(4)
-col9.metric("Period High", f"${max_close:,.2f}")
-col10.metric("Period Low", f"${min_close:,.2f}")
+col9, col10, col11, col12 = st.columns(4)
+col9.metric("Period High", format_metric(max_close, "currency"))
+col10.metric("Period Low", format_metric(min_close, "currency"))
+col11.metric("Jarque-Bera Stat", format_metric(primary_stats["Jarque-Bera Stat"]))
+col12.metric("Jarque-Bera p-value", format_metric(primary_stats["Jarque-Bera p-value"]))
 
 st.divider()
 
 st.subheader("Price and Moving Average")
-
 fig_price = go.Figure()
 fig_price.add_trace(
     go.Scatter(
-        x=df.index,
-        y=df["Close"],
+        x=primary_df.index,
+        y=primary_df["Close"],
         mode="lines",
-        name="Close Price",
+        name=f"{primary_ticker} Close",
         line=dict(width=2),
     )
 )
 fig_price.add_trace(
     go.Scatter(
-        x=df.index,
-        y=df[f"{ma_window}-Day MA"],
+        x=primary_df.index,
+        y=primary_df[f"{ma_window}-Day MA"],
         mode="lines",
         name=f"{ma_window}-Day MA",
         line=dict(width=2, dash="dash"),
@@ -161,25 +326,107 @@ fig_price.update_layout(
 )
 st.plotly_chart(fig_price, use_container_width=True)
 
-if ma_window > len(df):
+if ma_window > len(primary_df):
     st.warning(
         f"The selected {ma_window}-day window is longer than the available data "
-        f"({len(df)} trading days). The moving average line may not appear."
+        f"({len(primary_df)} trading days). The moving average line may not appear."
     )
 
-st.subheader("Cumulative Return Over Time")
-
-fig_cum = go.Figure()
-fig_cum.add_trace(
+st.subheader("Multi-Stock Cumulative Return Comparison")
+fig_compare = go.Figure()
+for ticker in cumulative_df.columns:
+    fig_compare.add_trace(
+        go.Scatter(
+            x=cumulative_df.index,
+            y=cumulative_df[ticker],
+            mode="lines",
+            name=ticker,
+        )
+    )
+if not benchmark_df.empty:
+    fig_compare.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_compare.add_trace(
     go.Scatter(
-        x=df.index,
-        y=df["Cumulative Return"],
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
         mode="lines",
-        name="Cumulative Return",
-        fill="tozeroy",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
     )
 )
-fig_cum.update_layout(
+fig_compare.update_layout(
+    template="plotly_white",
+    height=450,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_compare, use_container_width=True)
+
+st.subheader("Summary Statistics Table")
+summary_display = summary_df.copy()
+for col in ["Total Return", "Avg Daily Return", "Annualized Return", "Annualized Volatility", "Jarque-Bera p-value"]:
+    summary_display[col] = summary_display[col].map(lambda x: format_metric(x, "percent") if col != "Avg Daily Return" else format_metric(x, "small_percent"))
+summary_display["Sharpe Ratio"] = summary_display["Sharpe Ratio"].map(format_metric)
+summary_display["Skewness"] = summary_display["Skewness"].map(format_metric)
+summary_display["Excess Kurtosis"] = summary_display["Excess Kurtosis"].map(format_metric)
+summary_display["Jarque-Bera Stat"] = summary_display["Jarque-Bera Stat"].map(format_metric)
+summary_display["Observations"] = summary_display["Observations"].map(lambda x: format_metric(x, "integer"))
+summary_display["Latest Close"] = summary_display["Latest Close"].map(lambda x: format_metric(x, "currency"))
+summary_display["Period High"] = summary_display["Period High"].map(lambda x: format_metric(x, "currency"))
+summary_display["Period Low"] = summary_display["Period Low"].map(lambda x: format_metric(x, "currency"))
+st.dataframe(summary_display, use_container_width=True)
+
+st.subheader("Equal-Weight Portfolio Explorer")
+port_col1, port_col2 = st.columns(2)
+with port_col1:
+    st.metric("Portfolio Total Return", format_metric(portfolio_stats["Total Return"], "percent"))
+    st.metric("Portfolio Annualized Return", format_metric(portfolio_stats["Annualized Return"], "percent"))
+    st.metric("Portfolio Sharpe Ratio", format_metric(portfolio_stats["Sharpe Ratio"]))
+with port_col2:
+    st.metric("Portfolio Annualized Volatility", format_metric(portfolio_stats["Annualized Volatility"], "percent"))
+    st.metric("Portfolio Skewness", format_metric(portfolio_stats["Skewness"]))
+    st.metric("Portfolio Jarque-Bera p-value", format_metric(portfolio_stats["Jarque-Bera p-value"], "percent"))
+
+weights_df = pd.DataFrame(
+    {
+        "Ticker": list(asset_data.keys()),
+        "Weight": [1 / len(asset_data)] * len(asset_data),
+    }
+)
+weights_df["Weight"] = weights_df["Weight"].map(lambda x: f"{x:.2%}")
+st.dataframe(weights_df, use_container_width=True)
+
+fig_portfolio = go.Figure()
+fig_portfolio.add_trace(
+    go.Scatter(
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
+        mode="lines",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
+    )
+)
+if not benchmark_df.empty:
+    fig_portfolio.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_portfolio.update_layout(
     template="plotly_white",
     height=400,
     xaxis_title="Date",
@@ -187,15 +434,14 @@ fig_cum.update_layout(
     yaxis_tickformat=".0%",
     margin=dict(l=20, r=20, t=40, b=20),
 )
-st.plotly_chart(fig_cum, use_container_width=True)
+st.plotly_chart(fig_portfolio, use_container_width=True)
 
 st.subheader("Daily Trading Volume")
-
 fig_vol = go.Figure()
 fig_vol.add_trace(
     go.Bar(
-        x=df.index,
-        y=df["Volume"],
+        x=primary_df.index,
+        y=primary_df["Volume"],
         name="Volume",
         opacity=0.7,
     )
@@ -210,35 +456,95 @@ fig_vol.update_layout(
 st.plotly_chart(fig_vol, use_container_width=True)
 
 st.subheader("Distribution of Daily Returns")
-
+returns_clean = primary_df["Daily Return"].dropna()
 fig_hist = go.Figure()
 fig_hist.add_trace(
     go.Histogram(
-        x=df["Daily Return"].dropna(),
+        x=returns_clean,
         nbinsx=60,
         opacity=0.75,
         name="Daily Returns",
+        histnorm="probability density",
     )
 )
+if not returns_clean.empty:
+    x_range = np.linspace(float(returns_clean.min()), float(returns_clean.max()), 200)
+    mu = float(returns_clean.mean())
+    sigma = float(returns_clean.std())
+    if sigma > 0:
+        fig_hist.add_trace(
+            go.Scatter(
+                x=x_range,
+                y=stats.norm.pdf(x_range, mu, sigma),
+                mode="lines",
+                name="Normal Distribution",
+                line=dict(width=2),
+            )
+        )
 fig_hist.update_layout(
     template="plotly_white",
     height=350,
     xaxis_title="Daily Return",
-    yaxis_title="Frequency",
+    yaxis_title="Density",
     margin=dict(l=20, r=20, t=40, b=20),
 )
 st.plotly_chart(fig_hist, use_container_width=True)
+st.caption(
+    f"Jarque-Bera test for {primary_ticker}: statistic = {primary_stats['Jarque-Bera Stat']:.2f}, "
+    f"p-value = {primary_stats['Jarque-Bera p-value']:.4f}"
+)
+
+st.subheader("Q-Q Plot")
+qq_returns = returns_clean.tail(min(len(returns_clean), qq_sample_size))
+fig_qq = go.Figure()
+if len(qq_returns) > 1:
+    osm, osr = stats.probplot(qq_returns, dist="norm", fit=False)
+    fig_qq.add_trace(
+        go.Scatter(
+            x=osm,
+            y=osr,
+            mode="markers",
+            name="Observed Returns",
+        )
+    )
+    slope, intercept, _ = stats.probplot(qq_returns, dist="norm", fit=True)[1]
+    x_line = np.linspace(min(osm), max(osm), 100)
+    y_line = slope * x_line + intercept
+    fig_qq.add_trace(
+        go.Scatter(
+            x=x_line,
+            y=y_line,
+            mode="lines",
+            name="Reference Line",
+        )
+    )
+fig_qq.update_layout(
+    template="plotly_white",
+    height=400,
+    xaxis_title="Theoretical Quantiles",
+    yaxis_title="Sample Quantiles",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_qq, use_container_width=True)
 
 st.subheader("Rolling Annualized Volatility")
-
 fig_roll_vol = go.Figure()
 fig_roll_vol.add_trace(
     go.Scatter(
-        x=df.index,
-        y=df["Rolling Volatility"],
+        x=primary_df.index,
+        y=primary_df["Rolling Volatility"],
         mode="lines",
         name=f"{vol_window}-Day Rolling Vol",
         line=dict(width=1.5),
+    )
+)
+fig_roll_vol.add_trace(
+    go.Scatter(
+        x=portfolio_vol.index,
+        y=portfolio_vol,
+        mode="lines",
+        name="Portfolio Rolling Vol",
+        line=dict(width=2, dash="dash"),
     )
 )
 fig_roll_vol.update_layout(
@@ -251,5 +557,64 @@ fig_roll_vol.update_layout(
 )
 st.plotly_chart(fig_roll_vol, use_container_width=True)
 
-with st.expander("Show raw data"):
-    st.dataframe(df.tail(50), use_container_width=True)
+if len(return_df.columns) >= 2:
+    st.subheader("Correlation Heatmap")
+    corr_matrix = return_df.dropna(how="all").corr()
+    fig_heat = go.Figure(
+        data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns,
+            y=corr_matrix.index,
+            zmin=-1,
+            zmax=1,
+            text=np.round(corr_matrix.values, 2),
+            texttemplate="%{text}",
+        )
+    )
+    fig_heat.update_layout(
+        template="plotly_white",
+        height=500,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    st.subheader("Rolling Correlation")
+    corr_options = list(return_df.columns)
+    corr_a = st.selectbox("First ticker", corr_options, index=0, key="corr_a")
+    corr_b = st.selectbox("Second ticker", corr_options, index=1 if len(corr_options) > 1 else 0, key="corr_b")
+
+    if corr_a == corr_b:
+        st.info("Choose two different tickers to view rolling correlation.")
+    else:
+        rolling_corr = return_df[corr_a].rolling(corr_window).corr(return_df[corr_b])
+        fig_roll_corr = go.Figure()
+        fig_roll_corr.add_trace(
+            go.Scatter(
+                x=rolling_corr.index,
+                y=rolling_corr,
+                mode="lines",
+                name=f"{corr_a} vs {corr_b}",
+                line=dict(width=2),
+            )
+        )
+        fig_roll_corr.update_layout(
+            template="plotly_white",
+            height=400,
+            xaxis_title="Date",
+            yaxis_title="Rolling Correlation",
+            yaxis=dict(range=[-1, 1]),
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig_roll_corr, use_container_width=True)
+
+st.subheader("Raw Data")
+with st.expander(f"Show raw data for {primary_ticker}"):
+    st.dataframe(primary_df.tail(60), use_container_width=True)
+
+csv_data = primary_df.to_csv().encode("utf-8")
+st.download_button(
+    label=f"Download {primary_ticker} data as CSV",
+    data=csv_data,
+    file_name=f"{primary_ticker.lower()}_stock_data.csv",
+    mime="text/csv",
+)
