@@ -6,7 +6,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from plotly.subplots import make_subplots
 from scipy import stats
 
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
@@ -46,6 +45,31 @@ def load_data(symbols: tuple[str, ...], start: date, end: date) -> dict[str, pd.
     return data_map
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_single_data(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """Single-symbol convenience loader for exact guide parity."""
+    if not symbol:
+        return pd.DataFrame()
+
+    df = yf.download(
+        symbol,
+        start=start,
+        end=end + timedelta(days=1),
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if not df.empty:
+        df = df.sort_index()
+
+    return df
+
+
 def validate_data(df: pd.DataFrame) -> bool:
     required_cols = {"Close", "Volume"}
     return not df.empty and required_cols.issubset(df.columns)
@@ -56,8 +80,7 @@ def enrich_single_asset(df: pd.DataFrame, ma_window: int, vol_window: int) -> pd
     out["Daily Return"] = out["Close"].pct_change()
     out["Cumulative Return"] = (1 + out["Daily Return"].fillna(0)).cumprod() - 1
     out[f"{ma_window}-Day MA"] = out["Close"].rolling(window=ma_window).mean()
-    out["Rolling Volatility"] = out["Daily Return"].rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
-    out["Rolling Mean Return"] = out["Daily Return"].rolling(vol_window).mean()
+    out["Rolling Volatility"] = out["Daily Return"].rolling(window=vol_window).std() * math.sqrt(TRADING_DAYS)
     return out
 
 
@@ -118,12 +141,53 @@ def format_metric(value: float, kind: str = "number") -> str:
     return f"{value:.2f}"
 
 
+def compute_two_asset_portfolio(
+    returns_df: pd.DataFrame,
+    asset_a: str,
+    asset_b: str,
+    weight_a: float,
+) -> dict[str, object]:
+    pair_df = returns_df[[asset_a, asset_b]].dropna().copy()
+    weight_b = 1.0 - weight_a
+
+    if pair_df.empty:
+        return {
+            "pair_returns": pd.Series(dtype=float),
+            "covariance": float("nan"),
+            "corr": float("nan"),
+            "var_a": float("nan"),
+            "var_b": float("nan"),
+            "portfolio_variance": float("nan"),
+            "portfolio_volatility": float("nan"),
+            "weight_b": weight_b,
+        }
+
+    pair_df["Portfolio Return"] = weight_a * pair_df[asset_a] + weight_b * pair_df[asset_b]
+
+    var_a = float(pair_df[asset_a].var())
+    var_b = float(pair_df[asset_b].var())
+    covariance = float(pair_df[[asset_a, asset_b]].cov().iloc[0, 1])
+    corr = float(pair_df[[asset_a, asset_b]].corr().iloc[0, 1])
+
+    portfolio_variance = (weight_a ** 2) * var_a + (weight_b ** 2) * var_b + 2 * weight_a * weight_b * covariance
+    portfolio_volatility = math.sqrt(portfolio_variance) if portfolio_variance >= 0 else float("nan")
+
+    return {
+        "pair_returns": pair_df["Portfolio Return"],
+        "covariance": covariance,
+        "corr": corr,
+        "var_a": var_a,
+        "var_b": var_b,
+        "portfolio_variance": portfolio_variance,
+        "portfolio_volatility": portfolio_volatility,
+        "weight_b": weight_b,
+    }
+
+
 st.title("Stock Analysis Dashboard")
 st.sidebar.header("Settings")
 
-raw_tickers = st.sidebar.text_input(
-    "Tickers (comma-separated)", value=", ".join(DEFAULT_TICKERS)
-)
+raw_tickers = st.sidebar.text_input("Tickers (comma-separated)", value=", ".join(DEFAULT_TICKERS))
 user_tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
 user_tickers = list(dict.fromkeys(user_tickers))
 
@@ -178,7 +242,11 @@ corr_window = st.sidebar.slider(
 )
 
 qq_sample_size = st.sidebar.slider(
-    "Q-Q Plot Sample Size", min_value=50, max_value=500, value=250, step=25
+    "Q-Q Plot Sample Size",
+    min_value=50,
+    max_value=500,
+    value=250,
+    step=25,
 )
 
 if not portfolio_tickers:
@@ -220,18 +288,14 @@ if include_benchmark:
 primary_ticker = next(iter(asset_data.keys()))
 primary_df = asset_data[primary_ticker]
 
-price_df = pd.concat(
-    [df["Close"].rename(ticker) for ticker, df in asset_data.items()], axis=1
-).dropna(how="all")
-return_df = pd.concat(
-    [df["Daily Return"].rename(ticker) for ticker, df in asset_data.items()], axis=1
-).dropna(how="all")
+price_df = pd.concat([df["Close"].rename(ticker) for ticker, df in asset_data.items()], axis=1).dropna(how="all")
+return_df = pd.concat([df["Daily Return"].rename(ticker) for ticker, df in asset_data.items()], axis=1).dropna(how="all")
 cumulative_df = (1 + return_df.fillna(0)).cumprod() - 1
 
 portfolio_returns = return_df.copy().dropna(how="all")
 portfolio_returns["Equal Weight Portfolio"] = portfolio_returns.mean(axis=1, skipna=True)
 portfolio_cumulative = (1 + portfolio_returns["Equal Weight Portfolio"].fillna(0)).cumprod() - 1
-portfolio_vol = portfolio_returns["Equal Weight Portfolio"].rolling(vol_window).std() * math.sqrt(TRADING_DAYS)
+portfolio_vol = portfolio_returns["Equal Weight Portfolio"].rolling(window=vol_window).std() * math.sqrt(TRADING_DAYS)
 
 summary_rows = []
 for ticker, df in asset_data.items():
@@ -276,7 +340,7 @@ primary_stats = compute_summary_stats(primary_df["Daily Return"], risk_free_rate
 max_close = float(primary_df["Close"].max())
 min_close = float(primary_df["Close"].min())
 
-st.subheader(f"{primary_ticker} Key Metrics")
+st.subheader(f"{primary_ticker} — Key Metrics")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Latest Close", format_metric(latest_close, "currency"))
 col2.metric("Total Return", format_metric(primary_stats["Total Return"], "percent"))
@@ -284,7 +348,7 @@ col3.metric("Annualized Return", format_metric(primary_stats["Annualized Return"
 col4.metric("Sharpe Ratio", format_metric(primary_stats["Sharpe Ratio"]))
 
 col5, col6, col7, col8 = st.columns(4)
-col5.metric("Annualized Volatility", format_metric(primary_stats["Annualized Volatility"], "percent"))
+col5.metric("Annualized Volatility (sigma)", format_metric(primary_stats["Annualized Volatility"], "percent"))
 col6.metric("Skewness", format_metric(primary_stats["Skewness"]))
 col7.metric("Excess Kurtosis", format_metric(primary_stats["Excess Kurtosis"]))
 col8.metric("Avg Daily Return", format_metric(primary_stats["Avg Daily Return"], "small_percent"))
@@ -297,7 +361,7 @@ col12.metric("Jarque-Bera p-value", format_metric(primary_stats["Jarque-Bera p-v
 
 st.divider()
 
-st.subheader("Price and Moving Average")
+st.subheader("Price & Moving Average")
 fig_price = go.Figure()
 fig_price.add_trace(
     go.Scatter(
@@ -331,110 +395,6 @@ if ma_window > len(primary_df):
         f"The selected {ma_window}-day window is longer than the available data "
         f"({len(primary_df)} trading days). The moving average line may not appear."
     )
-
-st.subheader("Multi-Stock Cumulative Return Comparison")
-fig_compare = go.Figure()
-for ticker in cumulative_df.columns:
-    fig_compare.add_trace(
-        go.Scatter(
-            x=cumulative_df.index,
-            y=cumulative_df[ticker],
-            mode="lines",
-            name=ticker,
-        )
-    )
-if not benchmark_df.empty:
-    fig_compare.add_trace(
-        go.Scatter(
-            x=benchmark_df.index,
-            y=benchmark_df["Cumulative Return"],
-            mode="lines",
-            name="^GSPC Benchmark",
-            line=dict(dash="dot"),
-        )
-    )
-fig_compare.add_trace(
-    go.Scatter(
-        x=portfolio_cumulative.index,
-        y=portfolio_cumulative,
-        mode="lines",
-        name="Equal Weight Portfolio",
-        line=dict(width=3),
-    )
-)
-fig_compare.update_layout(
-    template="plotly_white",
-    height=450,
-    xaxis_title="Date",
-    yaxis_title="Cumulative Return",
-    yaxis_tickformat=".0%",
-    margin=dict(l=20, r=20, t=40, b=20),
-)
-st.plotly_chart(fig_compare, use_container_width=True)
-
-st.subheader("Summary Statistics Table")
-summary_display = summary_df.copy()
-for col in ["Total Return", "Avg Daily Return", "Annualized Return", "Annualized Volatility", "Jarque-Bera p-value"]:
-    summary_display[col] = summary_display[col].map(lambda x: format_metric(x, "percent") if col != "Avg Daily Return" else format_metric(x, "small_percent"))
-summary_display["Sharpe Ratio"] = summary_display["Sharpe Ratio"].map(format_metric)
-summary_display["Skewness"] = summary_display["Skewness"].map(format_metric)
-summary_display["Excess Kurtosis"] = summary_display["Excess Kurtosis"].map(format_metric)
-summary_display["Jarque-Bera Stat"] = summary_display["Jarque-Bera Stat"].map(format_metric)
-summary_display["Observations"] = summary_display["Observations"].map(lambda x: format_metric(x, "integer"))
-summary_display["Latest Close"] = summary_display["Latest Close"].map(lambda x: format_metric(x, "currency"))
-summary_display["Period High"] = summary_display["Period High"].map(lambda x: format_metric(x, "currency"))
-summary_display["Period Low"] = summary_display["Period Low"].map(lambda x: format_metric(x, "currency"))
-st.dataframe(summary_display, use_container_width=True)
-
-st.subheader("Equal-Weight Portfolio Explorer")
-port_col1, port_col2 = st.columns(2)
-with port_col1:
-    st.metric("Portfolio Total Return", format_metric(portfolio_stats["Total Return"], "percent"))
-    st.metric("Portfolio Annualized Return", format_metric(portfolio_stats["Annualized Return"], "percent"))
-    st.metric("Portfolio Sharpe Ratio", format_metric(portfolio_stats["Sharpe Ratio"]))
-with port_col2:
-    st.metric("Portfolio Annualized Volatility", format_metric(portfolio_stats["Annualized Volatility"], "percent"))
-    st.metric("Portfolio Skewness", format_metric(portfolio_stats["Skewness"]))
-    st.metric("Portfolio Jarque-Bera p-value", format_metric(portfolio_stats["Jarque-Bera p-value"], "percent"))
-
-weights_df = pd.DataFrame(
-    {
-        "Ticker": list(asset_data.keys()),
-        "Weight": [1 / len(asset_data)] * len(asset_data),
-    }
-)
-weights_df["Weight"] = weights_df["Weight"].map(lambda x: f"{x:.2%}")
-st.dataframe(weights_df, use_container_width=True)
-
-fig_portfolio = go.Figure()
-fig_portfolio.add_trace(
-    go.Scatter(
-        x=portfolio_cumulative.index,
-        y=portfolio_cumulative,
-        mode="lines",
-        name="Equal Weight Portfolio",
-        line=dict(width=3),
-    )
-)
-if not benchmark_df.empty:
-    fig_portfolio.add_trace(
-        go.Scatter(
-            x=benchmark_df.index,
-            y=benchmark_df["Cumulative Return"],
-            mode="lines",
-            name="^GSPC Benchmark",
-            line=dict(dash="dot"),
-        )
-    )
-fig_portfolio.update_layout(
-    template="plotly_white",
-    height=400,
-    xaxis_title="Date",
-    yaxis_title="Cumulative Return",
-    yaxis_tickformat=".0%",
-    margin=dict(l=20, r=20, t=40, b=20),
-)
-st.plotly_chart(fig_portfolio, use_container_width=True)
 
 st.subheader("Daily Trading Volume")
 fig_vol = go.Figure()
@@ -494,6 +454,247 @@ st.caption(
     f"p-value = {primary_stats['Jarque-Bera p-value']:.4f}"
 )
 
+st.subheader("Cumulative Return Over Time")
+fig_cum = go.Figure()
+fig_cum.add_trace(
+    go.Scatter(
+        x=primary_df.index,
+        y=primary_df["Cumulative Return"],
+        mode="lines",
+        name="Cumulative Return",
+        fill="tozeroy",
+    )
+)
+fig_cum.update_layout(
+    template="plotly_white",
+    height=400,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_cum, use_container_width=True)
+
+st.subheader("Rolling Annualized Volatility")
+fig_roll_vol = go.Figure()
+fig_roll_vol.add_trace(
+    go.Scatter(
+        x=primary_df.index,
+        y=primary_df["Rolling Volatility"],
+        mode="lines",
+        name=f"{vol_window}-Day Rolling Vol",
+        line=dict(width=1.5),
+    )
+)
+fig_roll_vol.add_trace(
+    go.Scatter(
+        x=portfolio_vol.index,
+        y=portfolio_vol,
+        mode="lines",
+        name="Portfolio Rolling Vol",
+        line=dict(width=2, dash="dash"),
+    )
+)
+fig_roll_vol.update_layout(
+    template="plotly_white",
+    height=400,
+    xaxis_title="Date",
+    yaxis_title="Annualized Volatility",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_roll_vol, use_container_width=True)
+
+st.subheader("Multi-Stock Cumulative Return Comparison")
+fig_compare = go.Figure()
+for ticker in cumulative_df.columns:
+    fig_compare.add_trace(
+        go.Scatter(
+            x=cumulative_df.index,
+            y=cumulative_df[ticker],
+            mode="lines",
+            name=ticker,
+        )
+    )
+if not benchmark_df.empty:
+    fig_compare.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_compare.add_trace(
+    go.Scatter(
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
+        mode="lines",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
+    )
+)
+fig_compare.update_layout(
+    template="plotly_white",
+    height=450,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_compare, use_container_width=True)
+
+st.subheader("Summary Statistics Table")
+summary_display = summary_df.copy()
+for col in ["Total Return", "Avg Daily Return", "Annualized Return", "Annualized Volatility"]:
+    summary_display[col] = summary_display[col].map(
+        lambda x: format_metric(x, "small_percent") if col == "Avg Daily Return" else format_metric(x, "percent")
+    )
+summary_display["Jarque-Bera p-value"] = summary_display["Jarque-Bera p-value"].map(format_metric)
+summary_display["Sharpe Ratio"] = summary_display["Sharpe Ratio"].map(format_metric)
+summary_display["Skewness"] = summary_display["Skewness"].map(format_metric)
+summary_display["Excess Kurtosis"] = summary_display["Excess Kurtosis"].map(format_metric)
+summary_display["Jarque-Bera Stat"] = summary_display["Jarque-Bera Stat"].map(format_metric)
+summary_display["Observations"] = summary_display["Observations"].map(lambda x: format_metric(x, "integer"))
+summary_display["Latest Close"] = summary_display["Latest Close"].map(lambda x: format_metric(x, "currency"))
+summary_display["Period High"] = summary_display["Period High"].map(lambda x: format_metric(x, "currency"))
+summary_display["Period Low"] = summary_display["Period Low"].map(lambda x: format_metric(x, "currency"))
+st.dataframe(summary_display, use_container_width=True)
+
+st.subheader("Equal-Weight Portfolio Explorer")
+port_col1, port_col2 = st.columns(2)
+with port_col1:
+    st.metric("Portfolio Total Return", format_metric(portfolio_stats["Total Return"], "percent"))
+    st.metric("Portfolio Annualized Return", format_metric(portfolio_stats["Annualized Return"], "percent"))
+    st.metric("Portfolio Sharpe Ratio", format_metric(portfolio_stats["Sharpe Ratio"]))
+with port_col2:
+    st.metric("Portfolio Annualized Volatility", format_metric(portfolio_stats["Annualized Volatility"], "percent"))
+    st.metric("Portfolio Skewness", format_metric(portfolio_stats["Skewness"]))
+    st.metric("Portfolio Jarque-Bera p-value", format_metric(portfolio_stats["Jarque-Bera p-value"]))
+
+weights_df = pd.DataFrame(
+    {
+        "Ticker": list(asset_data.keys()),
+        "Weight": [1 / len(asset_data)] * len(asset_data),
+    }
+)
+weights_df["Weight"] = weights_df["Weight"].map(lambda x: f"{x:.2%}")
+st.dataframe(weights_df, use_container_width=True)
+
+fig_portfolio = go.Figure()
+fig_portfolio.add_trace(
+    go.Scatter(
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
+        mode="lines",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
+    )
+)
+if not benchmark_df.empty:
+    fig_portfolio.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_portfolio.update_layout(
+    template="plotly_white",
+    height=400,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+st.plotly_chart(fig_portfolio, use_container_width=True)
+
+st.subheader("Two-Asset Portfolio Explorer")
+valid_two_asset = len(return_df.columns) >= 2
+if not valid_two_asset:
+    st.info("Add at least two valid tickers to use the Two-Asset Portfolio Explorer.")
+else:
+    two_col1, two_col2, two_col3 = st.columns(3)
+    asset_options = list(return_df.columns)
+    asset_a = two_col1.selectbox("Asset 1", asset_options, index=0)
+    default_b_index = 1 if len(asset_options) > 1 else 0
+    asset_b = two_col2.selectbox("Asset 2", asset_options, index=default_b_index)
+    weight_a_pct = two_col3.slider("Weight in Asset 1 (%)", min_value=0, max_value=100, value=50, step=5)
+
+    if asset_a == asset_b:
+        st.error("Asset 1 and Asset 2 must be different.")
+    else:
+        weight_a = weight_a_pct / 100
+        two_asset = compute_two_asset_portfolio(return_df, asset_a, asset_b, weight_a)
+        weight_b = two_asset["weight_b"]
+
+        if two_asset["pair_returns"].empty:
+            st.error("Not enough overlapping return data to build the two-asset portfolio.")
+        else:
+            pair_stats = compute_summary_stats(two_asset["pair_returns"], risk_free_rate)
+            pair_cumulative = (1 + two_asset["pair_returns"].fillna(0)).cumprod() - 1
+
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("Weight in Asset 1", f"{weight_a:.0%}")
+            t2.metric("Weight in Asset 2", f"{weight_b:.0%}")
+            t3.metric("Portfolio Variance", f"{two_asset['portfolio_variance']:.8f}")
+            t4.metric("Portfolio Volatility", f"{two_asset['portfolio_volatility']:.4%}")
+
+            t5, t6, t7, t8 = st.columns(4)
+            t5.metric("Covariance", f"{two_asset['covariance']:.8f}")
+            t6.metric("Correlation", f"{two_asset['corr']:.2f}")
+            t7.metric("Two-Asset Total Return", format_metric(pair_stats["Total Return"], "percent"))
+            t8.metric("Two-Asset Sharpe", format_metric(pair_stats["Sharpe Ratio"]))
+
+            st.markdown(
+                f"**Portfolio variance formula:**  \\n"
+                f"σ²ₚ = w₁²σ₁² + w₂²σ₂² + 2w₁w₂Cov(R₁,R₂)  \\n"
+                f"= ({weight_a:.2f}² × {two_asset['var_a']:.8f}) + ({weight_b:.2f}² × {two_asset['var_b']:.8f}) "
+                f"+ 2 × {weight_a:.2f} × {weight_b:.2f} × {two_asset['covariance']:.8f}  \\n"
+                f"= **{two_asset['portfolio_variance']:.8f}**"
+            )
+
+            fig_two_asset = go.Figure()
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=pair_cumulative.index,
+                    y=pair_cumulative,
+                    mode="lines",
+                    name="Two-Asset Portfolio",
+                    line=dict(width=3),
+                )
+            )
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=cumulative_df.index,
+                    y=cumulative_df[asset_a],
+                    mode="lines",
+                    name=asset_a,
+                    line=dict(dash="dash"),
+                )
+            )
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=cumulative_df.index,
+                    y=cumulative_df[asset_b],
+                    mode="lines",
+                    name=asset_b,
+                    line=dict(dash="dot"),
+                )
+            )
+            fig_two_asset.update_layout(
+                template="plotly_white",
+                height=420,
+                xaxis_title="Date",
+                yaxis_title="Cumulative Return",
+                yaxis_tickformat=".0%",
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
+            st.plotly_chart(fig_two_asset, use_container_width=True)
+
 st.subheader("Q-Q Plot")
 qq_returns = returns_clean.tail(min(len(returns_clean), qq_sample_size))
 fig_qq = go.Figure()
@@ -527,36 +728,6 @@ fig_qq.update_layout(
 )
 st.plotly_chart(fig_qq, use_container_width=True)
 
-st.subheader("Rolling Annualized Volatility")
-fig_roll_vol = go.Figure()
-fig_roll_vol.add_trace(
-    go.Scatter(
-        x=primary_df.index,
-        y=primary_df["Rolling Volatility"],
-        mode="lines",
-        name=f"{vol_window}-Day Rolling Vol",
-        line=dict(width=1.5),
-    )
-)
-fig_roll_vol.add_trace(
-    go.Scatter(
-        x=portfolio_vol.index,
-        y=portfolio_vol,
-        mode="lines",
-        name="Portfolio Rolling Vol",
-        line=dict(width=2, dash="dash"),
-    )
-)
-fig_roll_vol.update_layout(
-    template="plotly_white",
-    height=400,
-    xaxis_title="Date",
-    yaxis_title="Annualized Volatility",
-    yaxis_tickformat=".0%",
-    margin=dict(l=20, r=20, t=40, b=20),
-)
-st.plotly_chart(fig_roll_vol, use_container_width=True)
-
 if len(return_df.columns) >= 2:
     st.subheader("Correlation Heatmap")
     corr_matrix = return_df.dropna(how="all").corr()
@@ -586,7 +757,7 @@ if len(return_df.columns) >= 2:
     if corr_a == corr_b:
         st.info("Choose two different tickers to view rolling correlation.")
     else:
-        rolling_corr = return_df[corr_a].rolling(corr_window).corr(return_df[corr_b])
+        rolling_corr = return_df[corr_a].rolling(window=corr_window).corr(return_df[corr_b])
         fig_roll_corr = go.Figure()
         fig_roll_corr.add_trace(
             go.Scatter(
@@ -608,7 +779,7 @@ if len(return_df.columns) >= 2:
         st.plotly_chart(fig_roll_corr, use_container_width=True)
 
 st.subheader("Raw Data")
-with st.expander(f"Show raw data for {primary_ticker}"):
+with st.expander(f"View Raw Data for {primary_ticker}"):
     st.dataframe(primary_df.tail(60), use_container_width=True)
 
 csv_data = primary_df.to_csv().encode("utf-8")
