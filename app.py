@@ -19,6 +19,16 @@ st.markdown(
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@300;400;500&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&display=swap');
 
+    /* ── Remove Streamlit top header bar ── */
+    [data-testid="stHeader"],
+    header[data-testid="stHeader"] {
+        display: none !important;
+        height: 0 !important;
+    }
+    /* Push content up to fill the removed header space */
+    .block-container { padding-top: 1.5rem !important; }
+    [data-testid="stAppViewContainer"] { margin-top: 0 !important; }
+
     /* ── Base ── */
     html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 
@@ -26,6 +36,81 @@ st.markdown(
         background: #0d0f14;
         color: #e8eaf0;
     }
+
+    /* ── All text inputs (main + sidebar) ── */
+    .stTextInput > div > div > input,
+    .stNumberInput > div > div > input {
+        background: #0d0f14 !important;
+        color: #e8eaf0 !important;
+        border: 1px solid #2a2e3d !important;
+        border-radius: 6px !important;
+        font-family: 'DM Mono', monospace !important;
+        font-size: .85rem !important;
+        caret-color: #f0c060;
+    }
+    .stTextInput > div > div > input:focus,
+    .stNumberInput > div > div > input:focus {
+        border-color: #f0c060 !important;
+        box-shadow: 0 0 0 2px rgba(240,192,96,.15) !important;
+        outline: none !important;
+    }
+    .stTextInput > div > div > input::placeholder,
+    .stNumberInput > div > div > input::placeholder {
+        color: #4a4e64 !important;
+    }
+
+    /* ── Number input stepper buttons ── */
+    .stNumberInput button {
+        background: #1e2330 !important;
+        color: #c8cad4 !important;
+        border: 1px solid #2a2e3d !important;
+    }
+    .stNumberInput button:hover { background: #2a2e3d !important; }
+
+    /* ── Selectbox / date inputs ── */
+    .stSelectbox > div > div,
+    .stDateInput > div > div > input {
+        background: #0d0f14 !important;
+        color: #e8eaf0 !important;
+        border: 1px solid #2a2e3d !important;
+        border-radius: 6px !important;
+        font-family: 'DM Mono', monospace !important;
+        font-size: .85rem !important;
+    }
+    /* Selectbox dropdown arrow area */
+    .stSelectbox [data-baseweb="select"] > div {
+        background: #0d0f14 !important;
+        border-color: #2a2e3d !important;
+    }
+    /* Selectbox dropdown menu */
+    [data-baseweb="popover"] [data-baseweb="menu"],
+    [data-baseweb="menu"] {
+        background: #12151c !important;
+        border: 1px solid #2a2e3d !important;
+    }
+    [data-baseweb="menu"] li,
+    [data-baseweb="option"] {
+        background: #12151c !important;
+        color: #c8cad4 !important;
+    }
+    [data-baseweb="option"]:hover,
+    [data-baseweb="menu"] li:hover {
+        background: #1e2330 !important;
+        color: #f0c060 !important;
+    }
+
+    /* ── Checkbox ── */
+    .stCheckbox > label > div {
+        background: #0d0f14 !important;
+        border-color: #2a2e3d !important;
+    }
+
+    /* ── Slider track & thumb ── */
+    [data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
+        background: #f0c060 !important;
+        border-color: #f0c060 !important;
+    }
+    [data-testid="stSlider"] div[data-testid="stTickBar"] { color: #4a4e64 !important; }
 
     /* ── Sidebar ── */
     [data-testid="stSidebar"] {
