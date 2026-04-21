@@ -430,6 +430,23 @@ def compute_recommendation_features(df: pd.DataFrame, risk_free_rate: float) -> 
     }
 
 
+def score_to_signal(score: float) -> tuple[str, str, str]:
+    """Return (label, emoji, hex_color) for a recommendation score.
+
+    Thresholds calibrated to the weighted composite:
+      score >  0.15  → Buy
+      score < -0.05  → Sell
+      otherwise      → Hold
+    """
+    if math.isnan(score):
+        return "N/A", "—", "#6b6f87"
+    if score > 0.15:
+        return "BUY",  "▲", "#34c77a"
+    if score < -0.05:
+        return "SELL", "▼", "#e05c5c"
+    return "HOLD", "◆", "#f0c060"
+
+
 @st.cache_data(ttl=3600, show_spinner="Scanning candidate universe…")
 def build_program_suggestions(
     candidate_tickers: tuple[str, ...],
