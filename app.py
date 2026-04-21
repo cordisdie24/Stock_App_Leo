@@ -26,7 +26,11 @@ FALLBACK_UNIVERSE = [
     "CAT", "DE", "GE", "RTX", "BA", "HON", "ETN", "LMT", "NOC", "UNP",
     "SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLI", "XLV", "XLY",
 ]
-UNIVERSE_FILE_CANDIDATES = ["stock_universe.csv", "ticker_universe.csv", "us_stocks_universe.csv"]
+UNIVERSE_FILE_CANDIDATES = [
+    "stock_universe.csv",
+    "ticker_universe.csv",
+    "us_stocks_universe.csv",
+]
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching stock data...")
@@ -64,6 +68,7 @@ def load_data(symbols: tuple[str, ...], start: date, end: date) -> dict[str, pd.
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_single_data(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """Single-symbol convenience loader."""
     if not symbol:
         return pd.DataFrame()
 
@@ -99,7 +104,9 @@ def enrich_single_asset(df: pd.DataFrame, ma_window: int, vol_window: int) -> pd
     out["Daily Return"] = out["Close"].pct_change()
     out["Cumulative Return"] = (1 + out["Daily Return"].fillna(0)).cumprod() - 1
     out[f"{ma_window}-Day MA"] = out["Close"].rolling(window=ma_window).mean()
-    out["Rolling Volatility"] = out["Daily Return"].rolling(window=vol_window).std() * math.sqrt(TRADING_DAYS)
+    out["Rolling Volatility"] = (
+        out["Daily Return"].rolling(window=vol_window).std() * math.sqrt(TRADING_DAYS)
+    )
     return out
 
 
@@ -129,7 +136,6 @@ def compute_summary_stats(returns: pd.Series, risk_free_rate: float) -> dict[str
         if ann_volatility and not math.isnan(ann_volatility)
         else float("nan")
     )
-
     jb_stat, jb_pvalue = stats.jarque_bera(returns)
 
     return {
@@ -183,7 +189,11 @@ def compute_recommendation_features(df: pd.DataFrame, risk_free_rate: float) -> 
     volatility = float(returns.std()) * math.sqrt(TRADING_DAYS)
     avg_daily = float(returns.mean())
     ann_return = avg_daily * TRADING_DAYS
-    sharpe = (ann_return - risk_free_rate) / volatility if volatility and not math.isnan(volatility) else float("nan")
+    sharpe = (
+        (ann_return - risk_free_rate) / volatility
+        if volatility and not math.isnan(volatility)
+        else float("nan")
+    )
     momentum_20 = float(close.iloc[-1] / close.iloc[-21] - 1) if len(close) > 20 else float("nan")
     momentum_60 = float(close.iloc[-1] / close.iloc[-61] - 1) if len(close) > 60 else float("nan")
     ma_20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else float("nan")
@@ -307,7 +317,11 @@ def get_candidate_universe(target_size: int) -> tuple[list[str], str]:
             try:
                 df = pd.read_csv(path)
                 first_col = df.columns[0]
-                tickers = [str(x).strip().upper() for x in df[first_col].dropna().tolist() if str(x).strip()]
+                tickers = [
+                    str(x).strip().upper()
+                    for x in df[first_col].dropna().tolist()
+                    if str(x).strip()
+                ]
                 tickers = list(dict.fromkeys(tickers))
                 if tickers:
                     return tickers[:target_size], f"Loaded {min(len(tickers), target_size):,} symbols from {file_name}."
@@ -315,24 +329,41 @@ def get_candidate_universe(target_size: int) -> tuple[list[str], str]:
                 pass
 
     fallback = list(dict.fromkeys(FALLBACK_UNIVERSE))
-    return fallback[:min(target_size, len(fallback))], (
+    return fallback[: min(target_size, len(fallback))], (
         "No local universe file was found, so the app is using a built-in fallback universe. "
         "For a true 10,000-symbol scan, add a CSV like stock_universe.csv with one ticker per row."
     )
 
 
 st.title("Stock Analysis Dashboard")
-st.caption("Analyze individual stocks, relative performance, and portfolio behavior in a cleaner dashboard layout.")
+st.caption(
+    "Analyze individual stocks, relative performance, and portfolio behavior in a cleaner dashboard layout."
+)
 st.sidebar.header("Controls")
 
-raw_tickers = st.sidebar.text_input("Tickers (comma-separated)", value=", ".join(DEFAULT_TICKERS))
+raw_tickers = st.sidebar.text_input(
+    "Tickers (comma-separated)",
+    value=", ".join(DEFAULT_TICKERS),
+)
 user_tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
 user_tickers = list(dict.fromkeys(user_tickers))
 
 include_benchmark = st.sidebar.checkbox("Include S&P 500 Benchmark (^GSPC)", value=True)
 show_program_suggestions = st.sidebar.checkbox("Show program-picked Up/Down suggestions", value=True)
-requested_pool_size = st.sidebar.number_input("Requested candidate pool size", min_value=100, max_value=10000, value=10000, step=100)
-max_live_scan = st.sidebar.slider("Live scan limit per run", min_value=50, max_value=500, value=200, step=25)
+requested_pool_size = st.sidebar.number_input(
+    "Requested candidate pool size",
+    min_value=100,
+    max_value=10000,
+    value=10000,
+    step=100,
+)
+max_live_scan = st.sidebar.slider(
+    "Live scan limit per run",
+    min_value=50,
+    max_value=500,
+    value=200,
+    step=25,
+)
 
 portfolio_tickers = list(user_tickers)
 fetch_tickers = list(user_tickers)
@@ -347,15 +378,48 @@ if start_date >= end_date:
     st.sidebar.error("Start date must be before end date.")
     st.stop()
 
-ma_window = st.sidebar.slider("Moving Average Window (days)", min_value=5, max_value=200, value=50, step=5)
-
-risk_free_rate = (
-    st.sidebar.number_input("Risk-Free Rate (%)", min_value=0.0, max_value=20.0, value=4.5, step=0.1) / 100
+ma_window = st.sidebar.slider(
+    "Moving Average Window (days)",
+    min_value=5,
+    max_value=200,
+    value=50,
+    step=5,
 )
 
-vol_window = st.sidebar.slider("Rolling Volatility Window (days)", min_value=10, max_value=120, value=30, step=5)
-corr_window = st.sidebar.slider("Rolling Correlation Window (days)", min_value=10, max_value=120, value=30, step=5)
-qq_sample_size = st.sidebar.slider("Q-Q Plot Sample Size", min_value=50, max_value=500, value=250, step=25)
+risk_free_rate = (
+    st.sidebar.number_input(
+        "Risk-Free Rate (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=4.5,
+        step=0.1,
+    )
+    / 100
+)
+
+vol_window = st.sidebar.slider(
+    "Rolling Volatility Window (days)",
+    min_value=10,
+    max_value=120,
+    value=30,
+    step=5,
+)
+
+corr_window = st.sidebar.slider(
+    "Rolling Correlation Window (days)",
+    min_value=10,
+    max_value=120,
+    value=30,
+    step=5,
+)
+
+qq_sample_size = st.sidebar.slider(
+    "Q-Q Plot Sample Size",
+    min_value=50,
+    max_value=500,
+    value=250,
+    step=25,
+)
 
 if not portfolio_tickers:
     st.info("Enter at least one stock ticker in the sidebar to get started.")
@@ -396,7 +460,10 @@ if include_benchmark:
 primary_ticker = next(iter(asset_data.keys()))
 primary_df = asset_data[primary_ticker]
 
-return_df = pd.concat([df["Daily Return"].rename(ticker) for ticker, df in asset_data.items()], axis=1).dropna(how="all")
+return_df = pd.concat(
+    [df["Daily Return"].rename(ticker) for ticker, df in asset_data.items()],
+    axis=1,
+).dropna(how="all")
 cumulative_df = (1 + return_df.fillna(0)).cumprod() - 1
 
 portfolio_returns = return_df.copy().dropna(how="all")
@@ -418,7 +485,14 @@ for ticker, df in asset_data.items():
     summary_rows.append(stats_map)
 
 portfolio_stats = compute_summary_stats(portfolio_returns["Equal Weight Portfolio"], risk_free_rate)
-portfolio_stats.update({"Ticker": "Equal Weight Portfolio", "Latest Close": float("nan"), "Period High": float("nan"), "Period Low": float("nan")})
+portfolio_stats.update(
+    {
+        "Ticker": "Equal Weight Portfolio",
+        "Latest Close": float("nan"),
+        "Period High": float("nan"),
+        "Period Low": float("nan"),
+    }
+)
 summary_rows.append(portfolio_stats)
 
 if not benchmark_df.empty:
@@ -470,43 +544,87 @@ if show_program_suggestions:
             "This keeps the app responsive and avoids Yahoo rate limits."
         )
 
-        suggestion_df = build_program_suggestions(tuple(candidate_universe), start_date, end_date, risk_free_rate, max_live_scan)
+        suggestion_df = build_program_suggestions(
+            tuple(candidate_universe),
+            start_date,
+            end_date,
+            risk_free_rate,
+            max_live_scan,
+        )
 
         if suggestion_df.empty:
             st.warning("No program-generated suggestions were available for the current scan settings.")
         else:
             up_col, down_col = st.columns(2)
+
             with up_col:
                 st.markdown("#### Top 10 highest recommendation scores")
                 top_up = suggestion_df.head(10).copy()
-                top_up_display = top_up[["Ticker", "Recommendation Score", "Sharpe Ratio", "Momentum 20D", "Annualized Return"]].copy()
+                top_up_display = top_up[
+                    ["Ticker", "Recommendation Score", "Sharpe Ratio", "Momentum 20D", "Annualized Return"]
+                ].copy()
                 top_up_display["Recommendation Score"] = top_up_display["Recommendation Score"].map(format_metric)
                 top_up_display["Sharpe Ratio"] = top_up_display["Sharpe Ratio"].map(format_metric)
-                top_up_display["Momentum 20D"] = top_up_display["Momentum 20D"].map(lambda x: format_metric(x, "percent"))
-                top_up_display["Annualized Return"] = top_up_display["Annualized Return"].map(lambda x: format_metric(x, "percent"))
+                top_up_display["Momentum 20D"] = top_up_display["Momentum 20D"].map(
+                    lambda x: format_metric(x, "percent")
+                )
+                top_up_display["Annualized Return"] = top_up_display["Annualized Return"].map(
+                    lambda x: format_metric(x, "percent")
+                )
                 st.dataframe(top_up_display, use_container_width=True, height=390)
 
             with down_col:
                 st.markdown("#### Top 10 lowest recommendation scores")
                 top_down = suggestion_df.tail(10).sort_values("Recommendation Score", ascending=True).copy()
-                top_down_display = top_down[["Ticker", "Recommendation Score", "Sharpe Ratio", "Momentum 20D", "Annualized Return"]].copy()
+                top_down_display = top_down[
+                    ["Ticker", "Recommendation Score", "Sharpe Ratio", "Momentum 20D", "Annualized Return"]
+                ].copy()
                 top_down_display["Recommendation Score"] = top_down_display["Recommendation Score"].map(format_metric)
                 top_down_display["Sharpe Ratio"] = top_down_display["Sharpe Ratio"].map(format_metric)
-                top_down_display["Momentum 20D"] = top_down_display["Momentum 20D"].map(lambda x: format_metric(x, "percent"))
-                top_down_display["Annualized Return"] = top_down_display["Annualized Return"].map(lambda x: format_metric(x, "percent"))
+                top_down_display["Momentum 20D"] = top_down_display["Momentum 20D"].map(
+                    lambda x: format_metric(x, "percent")
+                )
+                top_down_display["Annualized Return"] = top_down_display["Annualized Return"].map(
+                    lambda x: format_metric(x, "percent")
+                )
                 st.dataframe(top_down_display, use_container_width=True, height=390)
 
 st.divider()
 st.markdown("## Market View")
 st.subheader("Price & Moving Average")
 fig_price = go.Figure()
-fig_price.add_trace(go.Scatter(x=primary_df.index, y=primary_df["Close"], mode="lines", name=f"{primary_ticker} Close", line=dict(width=2)))
-fig_price.add_trace(go.Scatter(x=primary_df.index, y=primary_df[f"{ma_window}-Day MA"], mode="lines", name=f"{ma_window}-Day MA", line=dict(width=2, dash="dash")))
-fig_price.update_layout(template="plotly_white", height=450, xaxis_title="Date", yaxis_title="Price (USD)", margin=dict(l=20, r=20, t=40, b=20))
+fig_price.add_trace(
+    go.Scatter(
+        x=primary_df.index,
+        y=primary_df["Close"],
+        mode="lines",
+        name=f"{primary_ticker} Close",
+        line=dict(width=2),
+    )
+)
+fig_price.add_trace(
+    go.Scatter(
+        x=primary_df.index,
+        y=primary_df[f"{ma_window}-Day MA"],
+        mode="lines",
+        name=f"{ma_window}-Day MA",
+        line=dict(width=2, dash="dash"),
+    )
+)
+fig_price.update_layout(
+    template="plotly_white",
+    height=450,
+    xaxis_title="Date",
+    yaxis_title="Price (USD)",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
 st.plotly_chart(fig_price, use_container_width=True)
 
 if ma_window > len(primary_df):
-    st.warning(f"The selected {ma_window}-day window is longer than the available data ({len(primary_df)} trading days). The moving average line may not appear.")
+    st.warning(
+        f"The selected {ma_window}-day window is longer than the available data "
+        f"({len(primary_df)} trading days). The moving average line may not appear."
+    )
 
 st.divider()
 st.markdown("## Performance and Risk")
@@ -516,39 +634,108 @@ with perf_left:
     st.subheader("Daily Trading Volume")
     fig_vol = go.Figure()
     fig_vol.add_trace(go.Bar(x=primary_df.index, y=primary_df["Volume"], name="Volume", opacity=0.7))
-    fig_vol.update_layout(template="plotly_white", height=350, xaxis_title="Date", yaxis_title="Shares Traded", margin=dict(l=20, r=20, t=40, b=20))
+    fig_vol.update_layout(
+        template="plotly_white",
+        height=350,
+        xaxis_title="Date",
+        yaxis_title="Shares Traded",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
     st.plotly_chart(fig_vol, use_container_width=True)
 
 with perf_right:
     st.subheader("Distribution of Daily Returns")
     returns_clean = primary_df["Daily Return"].dropna()
     fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(x=returns_clean, nbinsx=60, opacity=0.75, name="Daily Returns", histnorm="probability density"))
+    fig_hist.add_trace(
+        go.Histogram(
+            x=returns_clean,
+            nbinsx=60,
+            opacity=0.75,
+            name="Daily Returns",
+            histnorm="probability density",
+        )
+    )
     if not returns_clean.empty:
         x_range = np.linspace(float(returns_clean.min()), float(returns_clean.max()), 200)
         mu = float(returns_clean.mean())
         sigma = float(returns_clean.std())
         if sigma > 0:
-            fig_hist.add_trace(go.Scatter(x=x_range, y=stats.norm.pdf(x_range, mu, sigma), mode="lines", name="Normal Distribution", line=dict(width=2)))
-    fig_hist.update_layout(template="plotly_white", height=350, xaxis_title="Daily Return", yaxis_title="Density", margin=dict(l=20, r=20, t=40, b=20))
+            fig_hist.add_trace(
+                go.Scatter(
+                    x=x_range,
+                    y=stats.norm.pdf(x_range, mu, sigma),
+                    mode="lines",
+                    name="Normal Distribution",
+                    line=dict(width=2),
+                )
+            )
+    fig_hist.update_layout(
+        template="plotly_white",
+        height=350,
+        xaxis_title="Daily Return",
+        yaxis_title="Density",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
     st.plotly_chart(fig_hist, use_container_width=True)
-    st.caption(f"Jarque-Bera test for {primary_ticker}: statistic = {primary_stats['Jarque-Bera Stat']:.2f}, p-value = {primary_stats['Jarque-Bera p-value']:.4f}")
+    st.caption(
+        f"Jarque-Bera test for {primary_ticker}: statistic = {primary_stats['Jarque-Bera Stat']:.2f}, "
+        f"p-value = {primary_stats['Jarque-Bera p-value']:.4f}"
+    )
 
 trend_left, trend_right = st.columns(2)
 
 with trend_left:
     st.subheader("Cumulative Return Over Time")
     fig_cum = go.Figure()
-    fig_cum.add_trace(go.Scatter(x=primary_df.index, y=primary_df["Cumulative Return"], mode="lines", name="Cumulative Return", fill="tozeroy"))
-    fig_cum.update_layout(template="plotly_white", height=400, xaxis_title="Date", yaxis_title="Cumulative Return", yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=40, b=20))
+    fig_cum.add_trace(
+        go.Scatter(
+            x=primary_df.index,
+            y=primary_df["Cumulative Return"],
+            mode="lines",
+            name="Cumulative Return",
+            fill="tozeroy",
+        )
+    )
+    fig_cum.update_layout(
+        template="plotly_white",
+        height=400,
+        xaxis_title="Date",
+        yaxis_title="Cumulative Return",
+        yaxis_tickformat=".0%",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
     st.plotly_chart(fig_cum, use_container_width=True)
 
 with trend_right:
     st.subheader("Rolling Annualized Volatility")
     fig_roll_vol = go.Figure()
-    fig_roll_vol.add_trace(go.Scatter(x=primary_df.index, y=primary_df["Rolling Volatility"], mode="lines", name=f"{vol_window}-Day Rolling Vol", line=dict(width=1.5)))
-    fig_roll_vol.add_trace(go.Scatter(x=portfolio_vol.index, y=portfolio_vol, mode="lines", name="Portfolio Rolling Vol", line=dict(width=2, dash="dash")))
-    fig_roll_vol.update_layout(template="plotly_white", height=400, xaxis_title="Date", yaxis_title="Annualized Volatility", yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=40, b=20))
+    fig_roll_vol.add_trace(
+        go.Scatter(
+            x=primary_df.index,
+            y=primary_df["Rolling Volatility"],
+            mode="lines",
+            name=f"{vol_window}-Day Rolling Vol",
+            line=dict(width=1.5),
+        )
+    )
+    fig_roll_vol.add_trace(
+        go.Scatter(
+            x=portfolio_vol.index,
+            y=portfolio_vol,
+            mode="lines",
+            name="Portfolio Rolling Vol",
+            line=dict(width=2, dash="dash"),
+        )
+    )
+    fig_roll_vol.update_layout(
+        template="plotly_white",
+        height=400,
+        xaxis_title="Date",
+        yaxis_title="Annualized Volatility",
+        yaxis_tickformat=".0%",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
     st.plotly_chart(fig_roll_vol, use_container_width=True)
 
 st.divider()
@@ -556,17 +743,49 @@ st.markdown("## Relative Performance")
 st.subheader("Multi-Stock Cumulative Return Comparison")
 fig_compare = go.Figure()
 for ticker in cumulative_df.columns:
-    fig_compare.add_trace(go.Scatter(x=cumulative_df.index, y=cumulative_df[ticker], mode="lines", name=ticker))
+    fig_compare.add_trace(
+        go.Scatter(
+            x=cumulative_df.index,
+            y=cumulative_df[ticker],
+            mode="lines",
+            name=ticker,
+        )
+    )
 if not benchmark_df.empty:
-    fig_compare.add_trace(go.Scatter(x=benchmark_df.index, y=benchmark_df["Cumulative Return"], mode="lines", name="^GSPC Benchmark", line=dict(dash="dot")))
-fig_compare.add_trace(go.Scatter(x=portfolio_cumulative.index, y=portfolio_cumulative, mode="lines", name="Equal Weight Portfolio", line=dict(width=3)))
-fig_compare.update_layout(template="plotly_white", height=450, xaxis_title="Date", yaxis_title="Cumulative Return", yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=40, b=20))
+    fig_compare.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_compare.add_trace(
+    go.Scatter(
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
+        mode="lines",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
+    )
+)
+fig_compare.update_layout(
+    template="plotly_white",
+    height=450,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
 st.plotly_chart(fig_compare, use_container_width=True)
 
 st.subheader("Summary Statistics Table")
 summary_display = summary_df.copy()
 for col in ["Total Return", "Avg Daily Return", "Annualized Return", "Annualized Volatility"]:
-    summary_display[col] = summary_display[col].map(lambda x: format_metric(x, "small_percent") if col == "Avg Daily Return" else format_metric(x, "percent"))
+    summary_display[col] = summary_display[col].map(
+        lambda x: format_metric(x, "small_percent") if col == "Avg Daily Return" else format_metric(x, "percent")
+    )
 summary_display["Jarque-Bera p-value"] = summary_display["Jarque-Bera p-value"].map(format_metric)
 summary_display["Sharpe Ratio"] = summary_display["Sharpe Ratio"].map(format_metric)
 summary_display["Skewness"] = summary_display["Skewness"].map(format_metric)
@@ -582,24 +801,54 @@ st.divider()
 st.markdown("## Portfolio Analysis")
 st.subheader("Equal-Weight Portfolio Explorer")
 port_col1, port_col2 = st.columns(2)
+
 with port_col1:
     st.metric("Portfolio Total Return", format_metric(portfolio_stats["Total Return"], "percent"))
     st.metric("Portfolio Annualized Return", format_metric(portfolio_stats["Annualized Return"], "percent"))
     st.metric("Portfolio Sharpe Ratio", format_metric(portfolio_stats["Sharpe Ratio"]))
+
 with port_col2:
     st.metric("Portfolio Annualized Volatility", format_metric(portfolio_stats["Annualized Volatility"], "percent"))
     st.metric("Portfolio Skewness", format_metric(portfolio_stats["Skewness"]))
     st.metric("Portfolio Jarque-Bera p-value", format_metric(portfolio_stats["Jarque-Bera p-value"]))
 
-weights_df = pd.DataFrame({"Ticker": list(asset_data.keys()), "Weight": [1 / len(asset_data)] * len(asset_data)})
+weights_df = pd.DataFrame(
+    {
+        "Ticker": list(asset_data.keys()),
+        "Weight": [1 / len(asset_data)] * len(asset_data),
+    }
+)
 weights_df["Weight"] = weights_df["Weight"].map(lambda x: f"{x:.2%}")
 st.dataframe(weights_df, use_container_width=True, height=220)
 
 fig_portfolio = go.Figure()
-fig_portfolio.add_trace(go.Scatter(x=portfolio_cumulative.index, y=portfolio_cumulative, mode="lines", name="Equal Weight Portfolio", line=dict(width=3)))
+fig_portfolio.add_trace(
+    go.Scatter(
+        x=portfolio_cumulative.index,
+        y=portfolio_cumulative,
+        mode="lines",
+        name="Equal Weight Portfolio",
+        line=dict(width=3),
+    )
+)
 if not benchmark_df.empty:
-    fig_portfolio.add_trace(go.Scatter(x=benchmark_df.index, y=benchmark_df["Cumulative Return"], mode="lines", name="^GSPC Benchmark", line=dict(dash="dot")))
-fig_portfolio.update_layout(template="plotly_white", height=400, xaxis_title="Date", yaxis_title="Cumulative Return", yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=40, b=20))
+    fig_portfolio.add_trace(
+        go.Scatter(
+            x=benchmark_df.index,
+            y=benchmark_df["Cumulative Return"],
+            mode="lines",
+            name="^GSPC Benchmark",
+            line=dict(dash="dot"),
+        )
+    )
+fig_portfolio.update_layout(
+    template="plotly_white",
+    height=400,
+    xaxis_title="Date",
+    yaxis_title="Cumulative Return",
+    yaxis_tickformat=".0%",
+    margin=dict(l=20, r=20, t=40, b=20),
+)
 st.plotly_chart(fig_portfolio, use_container_width=True)
 
 st.subheader("Two-Asset Portfolio Explorer")
@@ -646,10 +895,41 @@ else:
             )
 
             fig_two_asset = go.Figure()
-            fig_two_asset.add_trace(go.Scatter(x=pair_cumulative.index, y=pair_cumulative, mode="lines", name="Two-Asset Portfolio", line=dict(width=3)))
-            fig_two_asset.add_trace(go.Scatter(x=cumulative_df.index, y=cumulative_df[asset_a], mode="lines", name=asset_a, line=dict(dash="dash")))
-            fig_two_asset.add_trace(go.Scatter(x=cumulative_df.index, y=cumulative_df[asset_b], mode="lines", name=asset_b, line=dict(dash="dot")))
-            fig_two_asset.update_layout(template="plotly_white", height=420, xaxis_title="Date", yaxis_title="Cumulative Return", yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=40, b=20))
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=pair_cumulative.index,
+                    y=pair_cumulative,
+                    mode="lines",
+                    name="Two-Asset Portfolio",
+                    line=dict(width=3),
+                )
+            )
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=cumulative_df.index,
+                    y=cumulative_df[asset_a],
+                    mode="lines",
+                    name=asset_a,
+                    line=dict(dash="dash"),
+                )
+            )
+            fig_two_asset.add_trace(
+                go.Scatter(
+                    x=cumulative_df.index,
+                    y=cumulative_df[asset_b],
+                    mode="lines",
+                    name=asset_b,
+                    line=dict(dash="dot"),
+                )
+            )
+            fig_two_asset.update_layout(
+                template="plotly_white",
+                height=420,
+                xaxis_title="Date",
+                yaxis_title="Cumulative Return",
+                yaxis_tickformat=".0%",
+                margin=dict(l=20, r=20, t=40, b=20),
+            )
             st.plotly_chart(fig_two_asset, use_container_width=True)
 
 st.divider()
@@ -667,18 +947,43 @@ with diag_left:
         x_line = np.linspace(min(osm), max(osm), 100)
         y_line = slope * x_line + intercept
         fig_qq.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", name="Reference Line"))
-    fig_qq.update_layout(template="plotly_white", height=400, xaxis_title="Theoretical Quantiles", yaxis_title="Sample Quantiles", margin=dict(l=20, r=20, t=40, b=20))
+    fig_qq.update_layout(
+        template="plotly_white",
+        height=400,
+        xaxis_title="Theoretical Quantiles",
+        yaxis_title="Sample Quantiles",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
     st.plotly_chart(fig_qq, use_container_width=True)
 
 with diag_right:
     if len(return_df.columns) >= 2:
         st.subheader("Correlation Heatmap")
         corr_matrix = return_df.dropna(how="all").corr()
-        fig_heat = go.Figure(data=go.Heatmap(z=corr_matrix.values, x=corr_matrix.columns, y=corr_matrix.index, zmin=-1, zmax=1, text=np.round(corr_matrix.values, 2), texttemplate="%{text}"))
-        fig_heat.update_layout(template="plotly_white", height=400, margin=dict(l=20, r=20, t=40, b=20))
+        fig_heat = go.Figure(
+            data=go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.index,
+                zmin=-1,
+                zmax=1,
+                text=np.round(corr_matrix.values, 2),
+                texttemplate="%{text}",
+            )
+        )
+        fig_heat.update_layout(
+            template="plotly_white",
+            height=400,
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig_heat, use_container_width=True)
+    else:
+        st.info("Add at least two valid tickers to view the correlation heatmap.")
 
 st.subheader("Rolling Correlation")
+if len(return_df.columns) < 2:
+    st.info("Add at least two valid tickers to view rolling correlation.")
+else:
     corr_options = list(return_df.columns)
     corr_a = st.selectbox("First ticker", corr_options, index=0, key="corr_a")
     corr_b = st.selectbox("Second ticker", corr_options, index=1 if len(corr_options) > 1 else 0, key="corr_b")
@@ -688,8 +993,23 @@ st.subheader("Rolling Correlation")
     else:
         rolling_corr = return_df[corr_a].rolling(window=corr_window).corr(return_df[corr_b])
         fig_roll_corr = go.Figure()
-        fig_roll_corr.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{corr_a} vs {corr_b}", line=dict(width=2)))
-        fig_roll_corr.update_layout(template="plotly_white", height=400, xaxis_title="Date", yaxis_title="Rolling Correlation", yaxis=dict(range=[-1, 1]), margin=dict(l=20, r=20, t=40, b=20))
+        fig_roll_corr.add_trace(
+            go.Scatter(
+                x=rolling_corr.index,
+                y=rolling_corr,
+                mode="lines",
+                name=f"{corr_a} vs {corr_b}",
+                line=dict(width=2),
+            )
+        )
+        fig_roll_corr.update_layout(
+            template="plotly_white",
+            height=400,
+            xaxis_title="Date",
+            yaxis_title="Rolling Correlation",
+            yaxis=dict(range=[-1, 1]),
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig_roll_corr, use_container_width=True)
 
 st.divider()
@@ -699,4 +1019,9 @@ with st.expander(f"View Raw Data for {primary_ticker}"):
     st.dataframe(primary_df.tail(60), use_container_width=True)
 
 csv_data = primary_df.to_csv().encode("utf-8")
-st.download_button(label=f"Download {primary_ticker} data as CSV", data=csv_data, file_name=f"{primary_ticker.lower()}_stock_data.csv", mime="text/csv")
+st.download_button(
+    label=f"Download {primary_ticker} data as CSV",
+    data=csv_data,
+    file_name=f"{primary_ticker.lower()}_stock_data.csv",
+    mime="text/csv",
+)
